@@ -16,7 +16,7 @@ client = genai.Client(api_key=API_KEY)
 TEXT_MODEL = "gemini-2.5-flash"
 EMBED_MODEL = "text-embedding-004"
 
-st.set_page_config(page_title="InvoiceGPT — Gemini RAG", layout="wide")
+st.set_page_config(page_title="InvoiceGPT — Pure Gemini RAG", layout="wide")
 
 # =====================================================
 # UI
@@ -32,59 +32,50 @@ st.markdown("""
 }
 h1 {
     text-align: center;
-    font-size: 44px;
+    font-size: 42px;
     color: #9fdcff;
-    text-shadow: 0 0 20px rgba(0,200,255,0.7);
 }
 .glass {
     background: rgba(15,20,40,0.78);
-    backdrop-filter: blur(14px);
     padding: 20px;
     border-radius: 18px;
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("<h1>📄 InvoiceGPT — Gemini Vision RAG</h1>", unsafe_allow_html=True)
+st.markdown("<h1>📄 InvoiceGPT — Pure Page-Wise Gemini RAG</h1>", unsafe_allow_html=True)
 
 # =====================================================
-# IMAGE PREPROCESSING (CRITICAL)
+# IMAGE PREPROCESSING (VISION SAFE)
 # =====================================================
 def prepare_image(img: Image.Image) -> Image.Image:
     if img.mode != "RGB":
         img = img.convert("RGB")
-
-    max_width = 1600
-    if img.width > max_width:
-        ratio = max_width / img.width
-        img = img.resize(
-            (max_width, int(img.height * ratio)),
-            Image.LANCZOS
-        )
+    if img.width > 1600:
+        r = 1600 / img.width
+        img = img.resize((1600, int(img.height * r)), Image.LANCZOS)
     return img
 
 # =====================================================
-# GEMINI OCR (SAFE + RETRY)
+# GEMINI OCR — ONE PAGE ONLY
 # =====================================================
-def gemini_ocr(img: Image.Image, retries=3) -> str:
+def gemini_ocr_single_page(img: Image.Image, retries=3) -> str:
     img = prepare_image(img)
-
-    for attempt in range(retries):
+    for i in range(retries):
         try:
-            response = client.models.generate_content(
+            resp = client.models.generate_content(
                 model=TEXT_MODEL,
                 contents=[
-                    "Extract ALL readable text from this invoice page. "
-                    "Preserve invoice numbers, dates, GST, IRN, HSN, quantities, "
-                    "amounts EXACTLY. Do not summarize.",
+                    "Extract ALL readable text from this single document page. "
+                    "Preserve numbers, IDs, codes, dates, and formatting. "
+                    "Do NOT summarize.",
                     img
                 ]
             )
-            return response.text or ""
+            return resp.text or ""
         except ServerError:
-            if attempt == retries - 1:
-                return ""
-            time.sleep(2 ** attempt)
+            time.sleep(2 ** i)
+    return ""
 
 # =====================================================
 # EMBEDDINGS
@@ -100,25 +91,6 @@ def cosine(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 # =====================================================
-# SAFE GENERATION (FIXES ClientError)
-# =====================================================
-def safe_generate_text(prompt: str, retries=3) -> str:
-    for attempt in range(retries):
-        try:
-            resp = client.models.generate_content(
-                model=TEXT_MODEL,
-                contents=[prompt]  # MUST be list
-            )
-            return resp.text or ""
-        except Exception:
-            if attempt == retries - 1:
-                return "⚠️ Unable to answer due to Gemini limits."
-            time.sleep(2 ** attempt)
-
-def limit_text(text: str, max_chars=6000) -> str:
-    return text if len(text) <= max_chars else text[:max_chars]
-
-# =====================================================
 # SESSION STATE
 # =====================================================
 if "pages" not in st.session_state:
@@ -128,7 +100,7 @@ if "history" not in st.session_state:
     st.session_state.history = []
 
 # =====================================================
-# PDF UPLOAD
+# PDF UPLOAD & PAGE-WISE INDEXING
 # =====================================================
 with st.form("upload"):
     pdf_file = st.file_uploader("Upload PDF (scanned or digital)", type=["pdf"])
@@ -140,23 +112,19 @@ if process and pdf_file:
     reader = PdfReader(pdf_file)
     doc = fitz.open(stream=pdf_file.getvalue(), filetype="pdf")
 
-    with st.spinner("Indexing pages (text + OCR)…"):
+    with st.spinner("Indexing pages (one page at a time)…"):
         for i, page in enumerate(reader.pages):
             text = page.extract_text()
 
-            # OCR fallback for scanned pages
             if not text or len(text.strip()) < 50:
                 pix = doc[i].get_pixmap(dpi=150)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                text = gemini_ocr(img)
+                text = gemini_ocr_single_page(img)
 
-            if not text or len(text.strip()) < 50:
+            if not text:
                 continue
 
-            # light cleanup
-            text = "\n".join(
-                line.strip() for line in text.splitlines() if line.strip()
-            )
+            text = "\n".join(l.strip() for l in text.splitlines() if l.strip())
 
             st.session_state.pages.append({
                 "page": i + 1,
@@ -167,52 +135,63 @@ if process and pdf_file:
     st.success(f"Indexed {len(st.session_state.pages)} pages")
 
 # =====================================================
-# CHAT (RAG)
+# CHAT — PURE PAGE-WISE GEMINI RAG
 # =====================================================
 st.markdown("<div class='glass'>", unsafe_allow_html=True)
 
-question = st.text_input(
-    "Ask invoice questions (invoice no, PO, IRN, HSN, compare pages):"
-)
+question = st.text_input("Ask anything from the document")
 
 if st.button("Ask"):
     if not st.session_state.pages:
-        st.error("❌ No PDF indexed. Click Process PDF first.")
+        st.error("No PDF indexed.")
     else:
         q_emb = embed_text(question)
 
-        ranked = sorted(
+        # rank pages
+        ranked_pages = sorted(
             st.session_state.pages,
             key=lambda p: cosine(q_emb, p["embedding"]),
             reverse=True
         )
 
-        top_pages = ranked[:2]  # SMALL CONTEXT
+        answered = False
 
-        answers = []
-        for p in top_pages:
-            page_text = limit_text(p["text"])
-
+        for p in ranked_pages:
             prompt = f"""
-You are an invoice extraction engine.
+Answer the question using ONLY the text below.
 
-STRICT RULES:
-- Use ONLY the text below
-- Extract EXACT values
-- If multiple values exist, list all
-- Mention page number
-- Never hallucinate
+Rules:
+- Use ONLY this page
+- If answer is not present, say: "Not found on this page"
+- Do NOT guess
+- Be precise
 
 PAGE {p['page']} TEXT:
-{page_text}
+{p['text'][:4000]}
 
 QUESTION:
 {question}
 """
-            answer = safe_generate_text(prompt)
-            answers.append(f"📄 Page {p['page']}:\n{answer}")
+            try:
+                resp = client.models.generate_content(
+                    model=TEXT_MODEL,
+                    contents=[prompt]
+                )
 
-        st.session_state.history.append((question, "\n\n".join(answers)))
+                if resp.text and "not found" not in resp.text.lower():
+                    st.session_state.history.append(
+                        (question, f"📄 Page {p['page']}:\n{resp.text}")
+                    )
+                    answered = True
+                    break
+
+            except Exception:
+                continue
+
+        if not answered:
+            st.session_state.history.append(
+                (question, "❌ Answer not found in any page.")
+            )
 
 # =====================================================
 # HISTORY
