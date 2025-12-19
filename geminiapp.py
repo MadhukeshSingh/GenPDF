@@ -57,11 +57,11 @@ def gemini_ocr(image: Image.Image) -> str:
     return response.text or ""
 
 def embed_text(text: str) -> np.ndarray:
-    emb = client.models.embed_content(
+    result = client.models.embed_content(
         model="text-embedding-004",
-        content=text
+        contents=[text]
     )
-    return np.array(emb.embedding)
+    return np.array(result.embeddings[0].values)
 
 def cosine(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
@@ -165,3 +165,4 @@ for q, a in st.session_state.history:
     st.markdown(f"🤖 **InvoiceGPT:**\n{a}")
 
 st.markdown("</div>", unsafe_allow_html=True)
+
