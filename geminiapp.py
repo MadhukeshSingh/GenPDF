@@ -16,7 +16,7 @@ client = genai.Client(api_key=API_KEY)
 TEXT_MODEL = "gemini-2.5-flash"
 EMBED_MODEL = "text-embedding-004"
 
-st.set_page_config(page_title="InvoiceGPT — Gemini Vision RAG", layout="wide")
+st.set_page_config(page_title="InvoiceGPT — Gemini RAG", layout="wide")
 
 # =====================================================
 # UI
@@ -45,7 +45,7 @@ h1 {
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("<h1>📄 InvoiceGPT — Gemini Vision (Scanned + Digital)</h1>", unsafe_allow_html=True)
+st.markdown("<h1>📄 InvoiceGPT — Gemini Vision RAG</h1>", unsafe_allow_html=True)
 
 # =====================================================
 # IMAGE PREPROCESSING (CRITICAL)
@@ -64,7 +64,7 @@ def prepare_image(img: Image.Image) -> Image.Image:
     return img
 
 # =====================================================
-# GEMINI OCR (SAFE)
+# GEMINI OCR (SAFE + RETRY)
 # =====================================================
 def gemini_ocr(img: Image.Image, retries=3) -> str:
     img = prepare_image(img)
@@ -75,20 +75,19 @@ def gemini_ocr(img: Image.Image, retries=3) -> str:
                 model=TEXT_MODEL,
                 contents=[
                     "Extract ALL readable text from this invoice page. "
-                    "Preserve invoice numbers, dates, GST, IRN, HSN, amounts EXACTLY. "
-                    "Do not summarize.",
+                    "Preserve invoice numbers, dates, GST, IRN, HSN, quantities, "
+                    "amounts EXACTLY. Do not summarize.",
                     img
                 ]
             )
             return response.text or ""
-
         except ServerError:
             if attempt == retries - 1:
                 return ""
-            time.sleep(2 ** attempt)  # exponential backoff
+            time.sleep(2 ** attempt)
 
 # =====================================================
-# EMBEDDING
+# EMBEDDINGS
 # =====================================================
 def embed_text(text: str) -> np.ndarray:
     result = client.models.embed_content(
@@ -99,6 +98,25 @@ def embed_text(text: str) -> np.ndarray:
 
 def cosine(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+# =====================================================
+# SAFE GENERATION (FIXES ClientError)
+# =====================================================
+def safe_generate_text(prompt: str, retries=3) -> str:
+    for attempt in range(retries):
+        try:
+            resp = client.models.generate_content(
+                model=TEXT_MODEL,
+                contents=[prompt]  # MUST be list
+            )
+            return resp.text or ""
+        except Exception:
+            if attempt == retries - 1:
+                return "⚠️ Unable to answer due to Gemini limits."
+            time.sleep(2 ** attempt)
+
+def limit_text(text: str, max_chars=6000) -> str:
+    return text if len(text) <= max_chars else text[:max_chars]
 
 # =====================================================
 # SESSION STATE
@@ -126,7 +144,7 @@ if process and pdf_file:
         for i, page in enumerate(reader.pages):
             text = page.extract_text()
 
-            # OCR fallback
+            # OCR fallback for scanned pages
             if not text or len(text.strip()) < 50:
                 pix = doc[i].get_pixmap(dpi=150)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -135,7 +153,7 @@ if process and pdf_file:
             if not text or len(text.strip()) < 50:
                 continue
 
-            # Light cleanup
+            # light cleanup
             text = "\n".join(
                 line.strip() for line in text.splitlines() if line.strip()
             )
@@ -153,7 +171,9 @@ if process and pdf_file:
 # =====================================================
 st.markdown("<div class='glass'>", unsafe_allow_html=True)
 
-question = st.text_input("Ask invoice questions (invoice no, PO, IRN, HSN, compare pages):")
+question = st.text_input(
+    "Ask invoice questions (invoice no, PO, IRN, HSN, compare pages):"
+)
 
 if st.button("Ask"):
     if not st.session_state.pages:
@@ -171,6 +191,8 @@ if st.button("Ask"):
 
         answers = []
         for p in top_pages:
+            page_text = limit_text(p["text"])
+
             prompt = f"""
 You are an invoice extraction engine.
 
@@ -182,16 +204,13 @@ STRICT RULES:
 - Never hallucinate
 
 PAGE {p['page']} TEXT:
-{p['text']}
+{page_text}
 
 QUESTION:
 {question}
 """
-            resp = client.models.generate_content(
-                model=TEXT_MODEL,
-                contents=prompt
-            )
-            answers.append(f"📄 Page {p['page']}:\n{resp.text}")
+            answer = safe_generate_text(prompt)
+            answers.append(f"📄 Page {p['page']}:\n{answer}")
 
         st.session_state.history.append((question, "\n\n".join(answers)))
 
