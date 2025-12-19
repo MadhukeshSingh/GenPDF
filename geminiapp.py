@@ -1,16 +1,20 @@
-import io
+import time
 import numpy as np
 import streamlit as st
 import fitz  # PyMuPDF
 from pypdf import PdfReader
 from PIL import Image
 from google import genai
+from google.genai.errors import ServerError
 
 # =====================================================
 # GEMINI SETUP
 # =====================================================
 API_KEY = st.secrets["GEMINI_API_KEY"]
 client = genai.Client(api_key=API_KEY)
+
+TEXT_MODEL = "gemini-2.5-flash"
+EMBED_MODEL = "text-embedding-004"
 
 st.set_page_config(page_title="InvoiceGPT — Gemini Vision RAG", layout="wide")
 
@@ -44,27 +48,57 @@ h1 {
 st.markdown("<h1>📄 InvoiceGPT — Gemini Vision (Scanned + Digital)</h1>", unsafe_allow_html=True)
 
 # =====================================================
-# HELPERS
+# IMAGE PREPROCESSING (CRITICAL)
 # =====================================================
-def gemini_ocr(image: Image.Image) -> str:
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[
-            "Extract all readable text from this invoice page. Preserve numbers exactly.",
-            image
-        ]
-    )
-    return response.text or ""
+def prepare_image(img: Image.Image) -> Image.Image:
+    if img.mode != "RGB":
+        img = img.convert("RGB")
 
+    max_width = 1600
+    if img.width > max_width:
+        ratio = max_width / img.width
+        img = img.resize(
+            (max_width, int(img.height * ratio)),
+            Image.LANCZOS
+        )
+    return img
+
+# =====================================================
+# GEMINI OCR (SAFE)
+# =====================================================
+def gemini_ocr(img: Image.Image, retries=3) -> str:
+    img = prepare_image(img)
+
+    for attempt in range(retries):
+        try:
+            response = client.models.generate_content(
+                model=TEXT_MODEL,
+                contents=[
+                    "Extract ALL readable text from this invoice page. "
+                    "Preserve invoice numbers, dates, GST, IRN, HSN, amounts EXACTLY. "
+                    "Do not summarize.",
+                    img
+                ]
+            )
+            return response.text or ""
+
+        except ServerError:
+            if attempt == retries - 1:
+                return ""
+            time.sleep(2 ** attempt)  # exponential backoff
+
+# =====================================================
+# EMBEDDING
+# =====================================================
 def embed_text(text: str) -> np.ndarray:
     result = client.models.embed_content(
-        model="text-embedding-004",
+        model=EMBED_MODEL,
         contents=[text]
     )
     return np.array(result.embeddings[0].values)
 
 def cosine(a, b):
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 # =====================================================
 # SESSION STATE
@@ -85,23 +119,26 @@ with st.form("upload"):
 if process and pdf_file:
     st.session_state.pages.clear()
 
-    # Text-based extraction
     reader = PdfReader(pdf_file)
-
-    # Image-based extraction (PyMuPDF)
     doc = fitz.open(stream=pdf_file.getvalue(), filetype="pdf")
 
-    with st.spinner("Processing pages with Gemini Vision OCR..."):
+    with st.spinner("Indexing pages (text + OCR)…"):
         for i, page in enumerate(reader.pages):
             text = page.extract_text()
 
+            # OCR fallback
             if not text or len(text.strip()) < 50:
-                pix = doc[i].get_pixmap(dpi=200)
+                pix = doc[i].get_pixmap(dpi=150)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 text = gemini_ocr(img)
 
             if not text or len(text.strip()) < 50:
                 continue
+
+            # Light cleanup
+            text = "\n".join(
+                line.strip() for line in text.splitlines() if line.strip()
+            )
 
             st.session_state.pages.append({
                 "page": i + 1,
@@ -112,11 +149,11 @@ if process and pdf_file:
     st.success(f"Indexed {len(st.session_state.pages)} pages")
 
 # =====================================================
-# CHAT
+# CHAT (RAG)
 # =====================================================
 st.markdown("<div class='glass'>", unsafe_allow_html=True)
 
-question = st.text_input("Ask invoice questions:")
+question = st.text_input("Ask invoice questions (invoice no, PO, IRN, HSN, compare pages):")
 
 if st.button("Ask"):
     if not st.session_state.pages:
@@ -130,16 +167,17 @@ if st.button("Ask"):
             reverse=True
         )
 
-        top_pages = ranked[:2]
-        answers = []
+        top_pages = ranked[:2]  # SMALL CONTEXT
 
+        answers = []
         for p in top_pages:
             prompt = f"""
 You are an invoice extraction engine.
 
-RULES:
+STRICT RULES:
 - Use ONLY the text below
-- Extract exact values
+- Extract EXACT values
+- If multiple values exist, list all
 - Mention page number
 - Never hallucinate
 
@@ -150,7 +188,7 @@ QUESTION:
 {question}
 """
             resp = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=TEXT_MODEL,
                 contents=prompt
             )
             answers.append(f"📄 Page {p['page']}:\n{resp.text}")
@@ -165,4 +203,3 @@ for q, a in st.session_state.history:
     st.markdown(f"🤖 **InvoiceGPT:**\n{a}")
 
 st.markdown("</div>", unsafe_allow_html=True)
-
