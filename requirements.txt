@@ -1,9 +1,6 @@
 streamlit
-python-dotenv
+pymupdf
 pypdf
-pdf2image
-pytesseract
-opencv-python
 pillow
-google-generativeai
 numpy
+google-genai
