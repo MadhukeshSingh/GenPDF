@@ -1,21 +1,21 @@
 import os
-import cv2
+import io
 import numpy as np
-import pytesseract
 import streamlit as st
 from pypdf import PdfReader
-from pdf2image import convert_from_bytes
 import google.generativeai as genai
+from PIL import Image
 
 # =====================================================
-# GEMINI SETUP (SAFE FOR STREAMLIT CLOUD)
+# GEMINI SETUP (SAFE)
 # =====================================================
 API_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=API_KEY)
 
-MODEL = genai.GenerativeModel("gemini-2.5-flash")
+TEXT_MODEL = genai.GenerativeModel("gemini-2.5-flash")
+VISION_MODEL = genai.GenerativeModel("gemini-2.5-flash")
 
-st.set_page_config(page_title="InvoiceGPT — Gemini RAG", layout="wide")
+st.set_page_config(page_title="InvoiceGPT — Gemini Vision RAG", layout="wide")
 
 # =====================================================
 # UI
@@ -42,23 +42,26 @@ h1 {
     backdrop-filter: blur(14px);
     padding: 20px;
     border-radius: 18px;
-    box-shadow: 0 0 40px rgba(0,200,255,0.15);
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("<h1>📄 InvoiceGPT — Gemini RAG (Scanned + Digital)</h1>", unsafe_allow_html=True)
+st.markdown("<h1>📄 InvoiceGPT — Gemini Vision RAG</h1>", unsafe_allow_html=True)
 
 # =====================================================
 # HELPERS
 # =====================================================
-def ocr_image(img):
-    gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    return pytesseract.image_to_string(gray, lang="eng")
+def gemini_ocr_from_image(img: Image.Image) -> str:
+    """Gemini Vision OCR"""
+    response = VISION_MODEL.generate_content(
+        [
+            "Extract all readable text from this invoice page. Preserve numbers exactly.",
+            img
+        ]
+    )
+    return response.text or ""
 
 def embed_text(text: str) -> np.ndarray:
-    """Gemini embeddings"""
     emb = genai.embed_content(
         model="models/embedding-001",
         content=text
@@ -81,21 +84,23 @@ if "history" not in st.session_state:
 # PDF UPLOAD
 # =====================================================
 with st.form("upload"):
-    pdf_file = st.file_uploader("Drag and drop PDF (scanned or digital)", type=["pdf"])
+    pdf_file = st.file_uploader("Upload PDF (scanned or digital)", type=["pdf"])
     process = st.form_submit_button("📄 Process PDF")
 
 if process and pdf_file:
     st.session_state.pages.clear()
 
     reader = PdfReader(pdf_file)
-    images = convert_from_bytes(pdf_file.getvalue(), dpi=300)
 
-    with st.spinner("Reading & OCR processing pages..."):
+    with st.spinner("Extracting pages with Gemini Vision..."):
         for i, page in enumerate(reader.pages):
             text = page.extract_text()
 
+            # 🔥 Vision OCR fallback
             if not text or len(text.strip()) < 50:
-                text = ocr_image(images[i])
+                # render page as image using PyPDF
+                img = page.to_image(resolution=200).original
+                text = gemini_ocr_from_image(img)
 
             if not text or len(text.strip()) < 50:
                 continue
@@ -109,7 +114,7 @@ if process and pdf_file:
     st.success(f"Indexed {len(st.session_state.pages)} pages")
 
 # =====================================================
-# CHAT (RAG)
+# CHAT
 # =====================================================
 st.markdown("<div class='glass'>", unsafe_allow_html=True)
 
@@ -141,7 +146,7 @@ RULES:
 - Use ONLY the text below
 - Extract exact values
 - Mention page number
-- Do NOT hallucinate
+- Never hallucinate
 
 PAGE {p['page']} TEXT:
 {p['text']}
@@ -149,7 +154,7 @@ PAGE {p['page']} TEXT:
 QUESTION:
 {question}
 """
-            response = MODEL.generate_content(prompt)
+            response = TEXT_MODEL.generate_content(prompt)
             answers.append(f"📄 Page {p['page']}:\n{response.text}")
 
         st.session_state.history.append((question, "\n\n".join(answers)))
