@@ -1,19 +1,16 @@
-import os
 import io
 import numpy as np
 import streamlit as st
+import fitz  # PyMuPDF
 from pypdf import PdfReader
-import google.generativeai as genai
 from PIL import Image
+from google import genai
 
 # =====================================================
-# GEMINI SETUP (SAFE)
+# GEMINI SETUP
 # =====================================================
-API_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=API_KEY)
-
-TEXT_MODEL = genai.GenerativeModel("gemini-2.5-flash")
-VISION_MODEL = genai.GenerativeModel("gemini-2.5-flash")
+API_KEY = st.secrets["GEMINI_API_KEY"]
+client = genai.Client(api_key=API_KEY)
 
 st.set_page_config(page_title="InvoiceGPT — Gemini Vision RAG", layout="wide")
 
@@ -29,14 +26,12 @@ st.markdown("""
     background-size: cover;
     color: #e6f2ff;
 }
-
 h1 {
     text-align: center;
-    font-size: 46px;
+    font-size: 44px;
     color: #9fdcff;
-    text-shadow: 0 0 25px rgba(0,200,255,0.7);
+    text-shadow: 0 0 20px rgba(0,200,255,0.7);
 }
-
 .glass {
     background: rgba(15,20,40,0.78);
     backdrop-filter: blur(14px);
@@ -46,27 +41,27 @@ h1 {
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("<h1>📄 InvoiceGPT — Gemini Vision RAG</h1>", unsafe_allow_html=True)
+st.markdown("<h1>📄 InvoiceGPT — Gemini Vision (Scanned + Digital)</h1>", unsafe_allow_html=True)
 
 # =====================================================
 # HELPERS
 # =====================================================
-def gemini_ocr_from_image(img: Image.Image) -> str:
-    """Gemini Vision OCR"""
-    response = VISION_MODEL.generate_content(
-        [
+def gemini_ocr(image: Image.Image) -> str:
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
             "Extract all readable text from this invoice page. Preserve numbers exactly.",
-            img
+            image
         ]
     )
     return response.text or ""
 
 def embed_text(text: str) -> np.ndarray:
-    emb = genai.embed_content(
-        model="models/embedding-001",
+    emb = client.models.embed_content(
+        model="text-embedding-004",
         content=text
     )
-    return np.array(emb["embedding"])
+    return np.array(emb.embedding)
 
 def cosine(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
@@ -90,17 +85,20 @@ with st.form("upload"):
 if process and pdf_file:
     st.session_state.pages.clear()
 
+    # Text-based extraction
     reader = PdfReader(pdf_file)
 
-    with st.spinner("Extracting pages with Gemini Vision..."):
+    # Image-based extraction (PyMuPDF)
+    doc = fitz.open(stream=pdf_file.getvalue(), filetype="pdf")
+
+    with st.spinner("Processing pages with Gemini Vision OCR..."):
         for i, page in enumerate(reader.pages):
             text = page.extract_text()
 
-            # 🔥 Vision OCR fallback
             if not text or len(text.strip()) < 50:
-                # render page as image using PyPDF
-                img = page.to_image(resolution=200).original
-                text = gemini_ocr_from_image(img)
+                pix = doc[i].get_pixmap(dpi=200)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                text = gemini_ocr(img)
 
             if not text or len(text.strip()) < 50:
                 continue
@@ -118,13 +116,11 @@ if process and pdf_file:
 # =====================================================
 st.markdown("<div class='glass'>", unsafe_allow_html=True)
 
-question = st.text_input(
-    "Ask invoice questions (invoice no, PO, IRN, HSN, compare pages):"
-)
+question = st.text_input("Ask invoice questions:")
 
 if st.button("Ask"):
     if not st.session_state.pages:
-        st.error("❌ No PDF indexed. Click **Process PDF** first.")
+        st.error("❌ No PDF indexed. Click Process PDF first.")
     else:
         q_emb = embed_text(question)
 
@@ -135,7 +131,6 @@ if st.button("Ask"):
         )
 
         top_pages = ranked[:2]
-
         answers = []
 
         for p in top_pages:
@@ -154,8 +149,11 @@ PAGE {p['page']} TEXT:
 QUESTION:
 {question}
 """
-            response = TEXT_MODEL.generate_content(prompt)
-            answers.append(f"📄 Page {p['page']}:\n{response.text}")
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt
+            )
+            answers.append(f"📄 Page {p['page']}:\n{resp.text}")
 
         st.session_state.history.append((question, "\n\n".join(answers)))
 
